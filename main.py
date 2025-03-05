@@ -4,8 +4,43 @@ import io
 import os
 import sys
 import argparse
+import concurrent.futures
+from tqdm import tqdm
 
-def invert_pdf_colors(input_pdf_path, output_folder, dpi=300, quality=95):
+def process_page(args):
+    """Process a single page in parallel"""
+    document, page_num, dpi, quality = args
+
+    # Extract the page
+    page = document.load_page(page_num)
+
+    # Get the zoom factors to achieve the desired DPI
+    zoom = dpi / 72  # 72 is the base DPI
+    matrix = fitz.Matrix(zoom, zoom)
+
+    # Render the page as an image (pixmap) with higher resolution
+    pix = page.get_pixmap(matrix=matrix)
+
+    # Convert the pixmap to a PIL Image
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+
+    # Invert the image colors
+    inverted_img = ImageOps.invert(img.convert("RGB"))
+
+    # Convert PIL image to bytes with specified quality
+    img_bytes = io.BytesIO()
+    inverted_img.save(img_bytes, format='PNG', optimize=True, quality=quality)
+    img_bytes = img_bytes.getvalue()
+
+    # Return relevant info for output
+    return {
+        'page_num': page_num,
+        'img_bytes': img_bytes,
+        'rect': page.rect,
+        'annots': list(page.annots())
+    }
+
+def invert_pdf_colors(input_pdf_path, output_folder, dpi=300, quality=95, threads=10):
     # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
 
@@ -22,37 +57,41 @@ def invert_pdf_colors(input_pdf_path, output_folder, dpi=300, quality=95):
 
         print(f"Processing {input_filename}...")
 
-        for page_num in range(len(document)):
-            print(f"Inverting page {page_num + 1}/{len(document)}")
-            # Extract the page
-            page = document.load_page(page_num)
+        # Prepare arguments for parallel processing
+        page_count = len(document)
+        process_args = [(document, i, dpi, quality) for i in range(page_count)]
 
-            # Get the zoom factors to achieve the desired DPI
-            zoom = dpi / 72  # 72 is the base DPI
-            matrix = fitz.Matrix(zoom, zoom)
+        # Process pages in parallel
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            # Use tqdm for a progress bar
+            results = list(tqdm(
+                executor.map(process_page, process_args),
+                total=page_count,
+                desc="Inverting pages"
+            ))
 
-            # Render the page as an image (pixmap) with higher resolution
-            pix = page.get_pixmap(matrix=matrix)
+        # Sort results by page number to maintain order
+        results.sort(key=lambda x: x['page_num'])
 
-            # Convert the pixmap to a PIL Image
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-
-            # Invert the image colors
-            inverted_img = ImageOps.invert(img.convert("RGB"))
-
-            # Convert PIL image to bytes with specified quality
-            img_bytes = io.BytesIO()
-            inverted_img.save(img_bytes, format='PNG', optimize=True, quality=quality)
-            img_bytes = img_bytes.getvalue()
-
+        # Create output PDF from processed pages
+        for result in results:
             # Create new page in output PDF
-            new_page = output_pdf.new_page(width=page.rect.width, height=page.rect.height)
+            new_page = output_pdf.new_page(width=result['rect'].width, height=result['rect'].height)
 
             # Insert inverted image into the new page
             new_page.insert_image(
-                fitz.Rect(0, 0, page.rect.width, page.rect.height),
-                stream=img_bytes
+                fitz.Rect(0, 0, result['rect'].width, result['rect'].height),
+                stream=result['img_bytes']
             )
+
+            # Copy annotations
+            for annot in result['annots']:
+                new_page.insert_annot(annot.rect, annot)
+
+        # Copy outlines (table of contents)
+        toc = document.get_toc()
+        output_pdf.set_toc(toc)
 
         # Save the output PDF
         output_pdf.save(output_pdf_path, garbage=4, deflate=True)
@@ -78,6 +117,8 @@ def main():
                         help='Image quality (1-100, default: 95). Higher values give better quality but larger files')
     parser.add_argument('--low-quality', action='store_true',
                         help='Use low quality settings (equivalent to --dpi 150 --quality 75)')
+    parser.add_argument('--threads', type=int, default=10,
+                        help='Number of parallel threads to use (default: 10)')
 
     # Parse arguments
     args = parser.parse_args()
@@ -108,8 +149,13 @@ def main():
         print("Error: DPI must be between 72 and 600")
         sys.exit(1)
 
+    # Validate threads parameter
+    if args.threads < 1:
+        print("Error: Number of threads must be at least 1")
+        sys.exit(1)
+
     # Process the PDF
-    invert_pdf_colors(args.input_pdf, args.output_folder, dpi, quality)
+    invert_pdf_colors(args.input_pdf, args.output_folder, dpi, quality, args.threads)
 
 if __name__ == "__main__":
     main()
